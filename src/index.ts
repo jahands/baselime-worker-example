@@ -1,32 +1,47 @@
-/**
- * Welcome to Cloudflare Workers! This is your first worker.
- *
- * - Run `npm run dev` in your terminal to start a development server
- * - Open a browser tab at http://localhost:8787/ to see your worker in action
- * - Run `npm run deploy` to publish your worker
- *
- * Learn more at https://developers.cloudflare.com/workers/
- */
+import { BaselimeLogger } from '@baselime/edge-logger'
+import { instrument, ResolveConfigFn } from '@microlabs/otel-cf-workers'
+import { trace } from '@opentelemetry/api'
 
 export interface Env {
-	// Example binding to KV. Learn more at https://developers.cloudflare.com/workers/runtime-apis/kv/
-	// MY_KV_NAMESPACE: KVNamespace;
-	//
-	// Example binding to Durable Object. Learn more at https://developers.cloudflare.com/workers/runtime-apis/durable-objects/
-	// MY_DURABLE_OBJECT: DurableObjectNamespace;
-	//
-	// Example binding to R2. Learn more at https://developers.cloudflare.com/workers/runtime-apis/r2/
-	// MY_BUCKET: R2Bucket;
-	//
-	// Example binding to a Service. Learn more at https://developers.cloudflare.com/workers/runtime-apis/service-bindings/
-	// MY_SERVICE: Fetcher;
-	//
-	// Example binding to a Queue. Learn more at https://developers.cloudflare.com/queues/javascript-apis/
-	// MY_QUEUE: Queue;
+	BASELIME_KEY: string
 }
 
-export default {
+const config: ResolveConfigFn = (env: Env, _trigger) => {
+	return {
+		exporter: {
+			url: 'https://otel.baselime.io/v1/',
+			headers: { 'x-api-key': env.BASELIME_KEY },
+		},
+		service: { name: 'my-worker', namespace: 'otel' }
+	}
+}
+
+const handler = {
 	async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-		return new Response('Hello World!');
+		const logger = new BaselimeLogger({
+			ctx,
+			apiKey: env.BASELIME_KEY,
+			service: 'my-worker',
+			dataset: 'cloudflare',
+			namespace: 'fetch',
+			requestId: request.headers.get('cf-ray'),
+		})
+
+		const tracer = trace.getTracer('default')
+		await tracer.startActiveSpan('my-span', async (span) => {
+			span.setAttribute('foo', 'bar')
+			span.addEvent('my-event', { foo: 'bar' })
+			const res = await fetch('https://uuid.rocks/plain')
+			span.addEvent('fetch', { status: res.status })
+			const body = await res.text()
+			span.setAttribute('body', body)
+			logger.info('Hello world', { cfRay: request.headers.get('cf-ray'), foo: 'bar', body })
+			span.end()
+		})
+
+		ctx.waitUntil(logger.flush())
+		return new Response('Hello world!')
 	},
-};
+}
+
+export default instrument(handler, config)
